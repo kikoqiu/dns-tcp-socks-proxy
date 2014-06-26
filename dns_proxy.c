@@ -33,6 +33,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <errno.h>
+#include <pthread.h>
 
 int   SOCKS_PORT  = 9050;
 char *SOCKS_ADDR  = { "127.0.0.1" };
@@ -188,14 +189,61 @@ void tcp_query(void *query, response *buffer, int len) {
   buffer->length = recv(sock, buffer->buffer, 2048, 0);
 }
 
+
+
+void *thr_fn(void *arg) 
+{   
+	int sock=(int)arg;
+	struct sockaddr_in dns_client;
+	socklen_t dns_client_size = sizeof(struct sockaddr_in);
+	while(1){
+		char len, *query;
+		response *buffer = (response*)malloc(sizeof(response));
+		buffer->buffer = malloc(2048);
+		
+		// receive a dns request from the client
+		len = recvfrom(sock, buffer->buffer, 2048, 0, (struct sockaddr *)&dns_client, &dns_client_size);
+
+		// lets not fork if recvfrom was interrupted
+		if (len < 0 && errno == EINTR) { continue; }
+
+		// other invalid values from recvfrom
+		if (len < 0) {
+		  if (LOG == 1) { fprintf(LOG_FILE, "recvfrom failed: %s\n", strerror(errno)); }
+		  continue;
+		}
+		
+		pthread_t ntid;
+		// fork so we can keep receiving requests
+		pthread_create(&ntid, NULL, thr_fn, (void*)sock); 
+
+		// the tcp query requires the length to precede the packet, so we put the length there
+		query = malloc(len + 3);
+		query[0] = 0;
+		query[1] = len;
+		memcpy(query + 2, buffer->buffer, len);
+
+		// forward the packet to the tcp dns server
+		tcp_query(query, buffer, len + 2);
+
+		// send the reply back to the client (minus the length at the beginning)
+		sendto(sock, buffer->buffer + 2, buffer->length - 2, 0, (struct sockaddr *)&dns_client, sizeof(dns_client));
+
+		free(buffer->buffer);
+		free(buffer);
+		free(query);
+
+		return 0;
+	}
+	return 0;
+} 
+
+
+
 int udp_listener() {
   int sock;
-  char len, *query;
-  response *buffer = (response*)malloc(sizeof(response));
-  struct sockaddr_in dns_listener, dns_client;
-
-  buffer->buffer = malloc(2048);
-
+  struct sockaddr_in dns_listener;
+  
   memset(&dns_listener, 0, sizeof(dns_listener));
   dns_listener.sin_family = AF_INET;
   dns_listener.sin_port = htons(LISTEN_PORT);
@@ -209,13 +257,13 @@ int udp_listener() {
   if(bind(sock, (struct sockaddr*)&dns_listener, sizeof(dns_listener)) < 0)
     error("[!] Error binding on dns proxy");
 
-  FILE *resolv = fopen("/etc/resolv.conf", "w");
+  //FILE *resolv = fopen("/etc/resolv.conf", "w");
 
-  if (!resolv)
-    error("[!] Error opening /etc/resolv.conf");
+  //if (!resolv)
+   // error("[!] Error opening /etc/resolv.conf");
 
-  fprintf(resolv, "nameserver %s\n", LISTEN_ADDR);
-  fclose(resolv);
+  //fprintf(resolv, "nameserver %s\n", LISTEN_ADDR);
+  //fclose(resolv);
 
   if (strcmp(LOGFILE, "/dev/null") != 0) {
     LOG      = 1;
@@ -227,53 +275,24 @@ int udp_listener() {
   printf("[*] No errors, backgrounding process.\n");
 
   // daemonize the process.
-  if(fork() != 0) { exit(0); }
-  if(fork() != 0) { exit(0); }
+  //if(fork() != 0) { exit(0); }
+  //if(fork() != 0) { exit(0); }
 
-  setuid(getpwnam(USERNAME)->pw_uid);
-  setgid(getgrnam(GROUPNAME)->gr_gid);
-  socklen_t dns_client_size = sizeof(struct sockaddr_in);
+  //setuid(getpwnam(USERNAME)->pw_uid);
+  //setgid(getgrnam(GROUPNAME)->gr_gid);
+  
 
   // setup SIGCHLD handler to kill off zombie children
   struct sigaction reaper;
   memset(&reaper, 0, sizeof(struct sigaction));
   reaper.sa_handler = reaper_handle;
   sigaction(SIGCHLD, &reaper, 0);
-
-  while(1) {
-    // receive a dns request from the client
-    len = recvfrom(sock, buffer->buffer, 2048, 0, (struct sockaddr *)&dns_client, &dns_client_size);
-
-    // lets not fork if recvfrom was interrupted
-    if (len < 0 && errno == EINTR) { continue; }
-
-    // other invalid values from recvfrom
-    if (len < 0) {
-      if (LOG == 1) { fprintf(LOG_FILE, "recvfrom failed: %s\n", strerror(errno)); }
-      continue;
-    }
-
-    // fork so we can keep receiving requests
-    if (fork() != 0) { continue; }
-
-    // the tcp query requires the length to precede the packet, so we put the length there
-    query = malloc(len + 3);
-    query[0] = 0;
-    query[1] = len;
-    memcpy(query + 2, buffer->buffer, len);
-
-    // forward the packet to the tcp dns server
-    tcp_query(query, buffer, len + 2);
-
-    // send the reply back to the client (minus the length at the beginning)
-    sendto(sock, buffer->buffer + 2, buffer->length - 2, 0, (struct sockaddr *)&dns_client, sizeof(dns_client));
-
-    free(buffer->buffer);
-    free(buffer);
-    free(query);
-
-    exit(0);
-  }
+	
+	pthread_t ntid;
+   pthread_create(&ntid, NULL, thr_fn, (void*)sock); 
+   char tmp[1];
+   gets(tmp);
+   return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -314,8 +333,8 @@ int main(int argc, char *argv[]) {
   }
 
   if (getuid() != 0) {
-    printf("Error: this program must be run as root! Quitting\n");
-    exit(1);
+    printf("Warning: this program should be run as root! \n");
+    //exit(1);
   }
 
   printf("[*] Listening on: %s:%d\n", LISTEN_ADDR, LISTEN_PORT);
@@ -324,14 +343,14 @@ int main(int argc, char *argv[]) {
   parse_resolv_conf();
   printf("[*] Loaded %d DNS servers from %s.\n\n", NUM_DNS, RESOLVCONF);
 
-  if (!getpwnam(USERNAME)) {
+  /*if (!getpwnam(USERNAME)) {
     printf("[!] Username (%s) does not exist! Quiting\n", USERNAME);
     exit(1);
   }
   if (!getgrnam(GROUPNAME)) {
     printf("[!] Group (%s) does not exist! Quiting\n", GROUPNAME);
     exit(1);
-  }
+  }*/
 
   // start the dns proxy
   udp_listener();
